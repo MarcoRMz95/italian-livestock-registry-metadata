@@ -26,13 +26,24 @@ SPECIES_CATEGORIES = {
     "cattle": "BOV",
     "sheep-goats": "OVI",
     "pigs": "SUI",
-    "equids": "EQU",
+    "equids": "EQUI",
+}
+EQUID_ID_FIELDS = {
+    "electronic": "P_CODICE_CAPO",
+    "ueln": "P_CODICE_UELN",
+    "passport": "P_PASSAPORTO",
 }
 OUTPUT_FIELDS = [
     "query_code",
+    "query_code_type",
     "found",
     "species",
     "animal_code",
+    "electronic_id",
+    "ueln",
+    "passport",
+    "equid_name",
+    "dpa",
     "sex",
     "breed",
     "birth_date",
@@ -75,6 +86,7 @@ def parse_animal_metadata(
     text: str | None,
     query_code: str,
     species: str,
+    query_code_type: str = "animal-id",
 ) -> dict[str, Any]:
     """Parse the basic animal fields shown by the public VetInfo page."""
     normalized = normalize_text(text)
@@ -83,8 +95,15 @@ def parse_animal_metadata(
         normalized,
         rf"Data\s+(?:di\s+)?nascita\s*:\s*({DATE_PATTERN})",
     )
-    sex = _extract(normalized, r"Sesso\s*:\s*([^\n]+)")
-    breed = _extract(normalized, r"Razza\s*:\s*([^\n]+)")
+    sex = _extract(normalized, r"Sesso\s*:\s*(.+?)(?=\s+Dpa\s*:|\n|$)")
+    breed = _extract(
+        normalized,
+        r"Razza\s*:\s*(.+?)(?=\s+Identificativo/Nome|\n|$)",
+    )
+    ueln = _extract(normalized, r"Codice\s+UELN\s*:\s*([A-Z0-9./-]+)")
+    passport = _extract(normalized, r"Passaporto\s*:\s*([A-Z0-9./-]+)")
+    equid_name = _extract(normalized, r"Identificativo/Nome\s*:?\s*([^\n]+)")
+    dpa = _extract(normalized, r"Dpa\s*:\s*([^\n]+)")
 
     final_match = re.search(
         rf"(MACELLAZIONE\s+EFFETTUATA\s+IL\s+({DATE_PATTERN})\s+IN\s+([^\n]+))",
@@ -98,9 +117,15 @@ def parse_animal_metadata(
 
     return {
         "query_code": query_code,
+        "query_code_type": query_code_type,
         "found": found,
         "species": species,
         "animal_code": animal_code,
+        "electronic_id": animal_code if species == "equids" else "",
+        "ueln": ueln,
+        "passport": passport,
+        "equid_name": equid_name,
+        "dpa": dpa,
         "sex": sex,
         "breed": breed,
         "birth_date": birth_date,
@@ -145,6 +170,49 @@ def read_codes(
     return codes
 
 
+def infer_equid_id_type(code: str) -> str:
+    """Infer which of the three public equid fields accepts an identifier."""
+    identifier = normalize_identifier(code)
+    if len(identifier) == 15 and identifier.isdigit():
+        return "electronic"
+    if len(identifier) == 15 and identifier.isalnum():
+        return "ueln"
+    return "passport"
+
+
+def resolve_equid_id_type(code: str, requested_type: str) -> str:
+    """Resolve an explicit or automatically inferred equid identifier type."""
+    if requested_type == "auto":
+        return infer_equid_id_type(code)
+    if requested_type not in EQUID_ID_FIELDS:
+        choices = ", ".join(("auto", *EQUID_ID_FIELDS))
+        raise ValueError(f"Unsupported equid identifier type. Choose one of: {choices}")
+    return requested_type
+
+
+def auto_query_candidates(code: str, equid_id_type: str = "auto") -> list[tuple[str, str]]:
+    """Return a deterministic lookup order for automatic species detection."""
+    identifier = normalize_identifier(code)
+    resolved_equid_type = resolve_equid_id_type(identifier, equid_id_type)
+    equid_candidate = ("equids", resolved_equid_type)
+    standard_candidates = [
+        ("cattle", "animal-id"),
+        ("sheep-goats", "animal-id"),
+        ("pigs", "animal-id"),
+    ]
+
+    # Fifteen-character equid identifiers and short passport numbers are
+    # distinctive enough to query the equid form first.
+    likely_equid = (
+        equid_id_type != "auto"
+        or len(identifier) == 15
+        or len(identifier) <= 10
+    )
+    if likely_equid:
+        return [equid_candidate, *standard_candidates]
+    return [*standard_candidates, equid_candidate]
+
+
 def verify_registry_form(page: Page, species: str, timeout_ms: int) -> None:
     """Verify that a public VetInfo query form is available."""
     page.goto(
@@ -153,11 +221,23 @@ def verify_registry_form(page: Page, species: str, timeout_ms: int) -> None:
         timeout=timeout_ms,
     )
 
-    code_input = page.locator('input[name="P_CODICE_CAPO"]')
     search_button = page.locator("#CERCA_CAPI")
     category_input = page.locator('input[name="P_CAPI"]')
 
-    if code_input.count() != 1 or search_button.count() != 1:
+    expected_fields = (
+        tuple(EQUID_ID_FIELDS.values())
+        if species == "equids"
+        else ("P_CODICE_CAPO",)
+    )
+    fields_present = all(
+        page.locator(f'input[name="{field_name}"]').count() == 1
+        for field_name in expected_fields
+    )
+    if (
+        not fields_present
+        or search_button.count() != 1
+        or category_input.count() != 1
+    ):
         raise RuntimeError("The expected VetInfo query form was not found.")
 
     expected_category = SPECIES_CATEGORIES[species]
@@ -175,18 +255,34 @@ def query_animal(
     species: str,
     timeout_ms: int,
     settle_ms: int,
+    equid_id_type: str = "auto",
 ) -> dict[str, Any]:
     """Submit one animal identifier and return parsed public metadata."""
     try:
         verify_registry_form(page, species, timeout_ms)
-        code_input = page.locator('input[name="P_CODICE_CAPO"]')
+        query_code_type = (
+            resolve_equid_id_type(code, equid_id_type)
+            if species == "equids"
+            else "animal-id"
+        )
+        field_name = (
+            EQUID_ID_FIELDS[query_code_type]
+            if species == "equids"
+            else "P_CODICE_CAPO"
+        )
+        code_input = page.locator(f'input[name="{field_name}"]')
         search_button = page.locator("#CERCA_CAPI")
 
         code_input.fill(code)
         search_button.click()
         page.wait_for_timeout(settle_ms)
         response_text = page.locator("body").inner_text(timeout=timeout_ms)
-        return parse_animal_metadata(response_text, code, species)
+        return parse_animal_metadata(
+            response_text,
+            code,
+            species,
+            query_code_type=query_code_type,
+        )
     except PlaywrightTimeoutError as exc:
         error = f"VetInfo request timed out: {exc}"
     except Exception as exc:
@@ -194,9 +290,19 @@ def query_animal(
 
     return {
         "query_code": code,
+        "query_code_type": (
+            resolve_equid_id_type(code, equid_id_type)
+            if species == "equids"
+            else "animal-id"
+        ),
         "found": False,
         "species": species,
         "animal_code": "",
+        "electronic_id": "",
+        "ueln": "",
+        "passport": "",
+        "equid_name": "",
+        "dpa": "",
         "sex": "",
         "breed": "",
         "birth_date": "",
@@ -204,6 +310,47 @@ def query_animal(
         "event_date": "",
         "event_location": "",
         "error": error,
+    }
+
+
+def detect_and_query_animal(
+    page: Page,
+    code: str,
+    timeout_ms: int,
+    settle_ms: int,
+    equid_id_type: str = "auto",
+) -> dict[str, Any]:
+    """Query supported categories until VetInfo returns a recognized record."""
+    for species, code_type in auto_query_candidates(code, equid_id_type):
+        result = query_animal(
+            page,
+            code,
+            species,
+            timeout_ms,
+            settle_ms,
+            equid_id_type=code_type,
+        )
+        if result["found"]:
+            return result
+
+    return {
+        "query_code": code,
+        "query_code_type": "",
+        "found": False,
+        "species": "",
+        "animal_code": "",
+        "electronic_id": "",
+        "ueln": "",
+        "passport": "",
+        "equid_name": "",
+        "dpa": "",
+        "sex": "",
+        "breed": "",
+        "birth_date": "",
+        "final_event": "",
+        "event_date": "",
+        "event_location": "",
+        "error": "No record was found in any supported public category.",
     }
 
 
@@ -257,9 +404,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--species",
-        choices=tuple(SPECIES_CATEGORIES),
-        default="cattle",
-        help="VetInfo public query category (default: cattle).",
+        choices=("auto", *SPECIES_CATEGORIES),
+        default="auto",
+        help="VetInfo query category (default: auto-detect).",
+    )
+    parser.add_argument(
+        "--equid-id-type",
+        choices=("auto", *EQUID_ID_FIELDS),
+        default="auto",
+        help=(
+            "Equid identifier field: electronic, ueln, passport, or automatic "
+            "format detection (default: auto)."
+        ),
     )
     parser.add_argument(
         "--headed",
@@ -317,13 +473,23 @@ def main(argv: list[str] | None = None) -> int:
         try:
             for index, code in enumerate(codes, start=1):
                 print(f"Querying animal {index}/{len(codes)}...")
-                result = query_animal(
-                    page,
-                    code,
-                    args.species,
-                    timeout_ms,
-                    settle_ms,
-                )
+                if args.species == "auto":
+                    result = detect_and_query_animal(
+                        page,
+                        code,
+                        timeout_ms,
+                        settle_ms,
+                        equid_id_type=args.equid_id_type,
+                    )
+                else:
+                    result = query_animal(
+                        page,
+                        code,
+                        args.species,
+                        timeout_ms,
+                        settle_ms,
+                        equid_id_type=args.equid_id_type,
+                    )
                 results.append(result)
                 if index < len(codes):
                     time.sleep(args.delay_seconds)

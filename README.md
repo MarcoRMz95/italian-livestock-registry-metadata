@@ -10,6 +10,8 @@ Ministry of Health, or IZS Teramo.
 
 - Queries the public VetInfo animal lookup form with Playwright.
 - Supports cattle, sheep/goats, pigs, and equids.
+- Automatically detects the public species category by checking the registries.
+- Supports electronic identifiers, UELNs, and passports for equids.
 - Reads identifiers from the command line or a CSV file.
 - Exports normalized results to UTF-8 CSV.
 - Applies a delay between requests to avoid aggressive traffic.
@@ -21,7 +23,9 @@ Ministry of Health, or IZS Teramo.
 The tool extracts only the fields displayed by the public form:
 
 - Animal identifier
+- Identifier type used for the query
 - Species query category
+- Equid electronic identifier, UELN, passport, name, and DPA status when shown
 - Sex
 - Breed
 - Date of birth
@@ -62,18 +66,31 @@ python -m playwright install chromium
 
 ## Usage
 
-Query one or more cattle identifiers:
+Automatically identify the species category and query one or more identifiers:
 
 ```bash
 italian-livestock-metadata <ANIMAL_ID> <ANOTHER_ANIMAL_ID>
 ```
+
+Automatic mode queries the supported public registries until it recognizes a
+record. This is necessary because cattle, sheep/goat, and pig identifiers
+cannot always be distinguished reliably from their format alone.
 
 Choose another public VetInfo category:
 
 ```bash
 italian-livestock-metadata --species sheep-goats <ANIMAL_ID>
 italian-livestock-metadata --species pigs <ANIMAL_ID>
-italian-livestock-metadata --species equids <ANIMAL_ID>
+```
+
+For equids, provide an electronic identifier, UELN, or passport. The tool
+infers the field from common formats, or you can select it explicitly:
+
+```bash
+italian-livestock-metadata --species equids <EQUID_ID>
+italian-livestock-metadata --species equids --equid-id-type electronic <ELECTRONIC_ID>
+italian-livestock-metadata --species equids --equid-id-type ueln <UELN>
+italian-livestock-metadata --species equids --equid-id-type passport <PASSPORT_NUMBER>
 ```
 
 Read identifiers from a CSV file containing an `animal_code` column:
@@ -119,8 +136,11 @@ maintenance over time.
 
 ## Data source
 
-Data is retrieved at runtime from the
-[public VetInfo animal query](https://www.vetinfo.it/sso_portale/informazioni/int_capi_no_log.pl?P_CAPI=BOV).
+Data is retrieved at runtime from VetInfo's public query pages for
+[cattle](https://www.vetinfo.it/sso_portale/informazioni/int_capi_no_log.pl?P_CAPI=BOV),
+[sheep and goats](https://www.vetinfo.it/sso_portale/informazioni/int_capi_no_log.pl?P_CAPI=OVI),
+[pigs](https://www.vetinfo.it/sso_portale/informazioni/int_capi_no_log.pl?P_CAPI=SUI),
+and [equids](https://www.vetinfo.it/sso_portale/informazioni/int_capi_no_log.pl?P_CAPI=EQUI).
 VetInfo remains the authoritative source for the returned information.
 
 ## License

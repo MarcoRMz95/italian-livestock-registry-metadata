@@ -6,9 +6,12 @@ import unittest
 from pathlib import Path
 
 from italian_livestock_metadata import (
+    EQUID_ID_FIELDS,
     OUTPUT_FIELDS,
     SPECIES_CATEGORIES,
+    auto_query_candidates,
     build_registry_url,
+    infer_equid_id_type,
     normalize_identifier,
     parse_animal_metadata,
     read_codes,
@@ -28,6 +31,26 @@ Razza:
 SAMPLE BREED (TEST)
 Movimentazioni
 MACELLAZIONE EFFETTUATA IL 03/04/2025 IN SAMPLE LOCATION (XX)
+"""
+
+SYNTHETIC_EQUID_RESPONSE = """
+Dati anagrafici
+Codice Capo:
+123456789012345
+Data nascita:
+01/02/2020
+Codice UELN:
+123456789AB1234
+Passaporto:
+TESTP1
+Sesso:
+MASCHIO
+Dpa:
+NO
+Razza:
+SAMPLE EQUID BREED
+Identificativo/Nome
+SAMPLE HORSE
 """
 
 
@@ -58,6 +81,24 @@ class ParsingTests(unittest.TestCase):
         self.assertFalse(row["found"])
         self.assertEqual(row["animal_code"], "")
         self.assertIn("No animal record", row["error"])
+
+    def test_parses_equid_metadata_and_query_code_type(self) -> None:
+        row = parse_animal_metadata(
+            SYNTHETIC_EQUID_RESPONSE,
+            query_code="TESTP1",
+            species="equids",
+            query_code_type="passport",
+        )
+
+        self.assertTrue(row["found"])
+        self.assertEqual(row["query_code_type"], "passport")
+        self.assertEqual(row["electronic_id"], "123456789012345")
+        self.assertEqual(row["ueln"], "123456789AB1234")
+        self.assertEqual(row["passport"], "TESTP1")
+        self.assertEqual(row["equid_name"], "SAMPLE HORSE")
+        self.assertEqual(row["dpa"], "NO")
+        self.assertEqual(row["sex"], "MASCHIO")
+        self.assertEqual(row["breed"], "SAMPLE EQUID BREED")
 
 
 class InputTests(unittest.TestCase):
@@ -92,6 +133,41 @@ class OutputAndRoutingTests(unittest.TestCase):
             with self.subTest(species=species):
                 url = build_registry_url(species)
                 self.assertIn(f"P_CAPI={portal_code}", url)
+
+        self.assertEqual(SPECIES_CATEGORIES["equids"], "EQUI")
+
+    def test_maps_all_three_equid_identifier_fields(self) -> None:
+        self.assertEqual(
+            EQUID_ID_FIELDS,
+            {
+                "electronic": "P_CODICE_CAPO",
+                "ueln": "P_CODICE_UELN",
+                "passport": "P_PASSAPORTO",
+            },
+        )
+
+    def test_infers_equid_identifier_types(self) -> None:
+        self.assertEqual(infer_equid_id_type("123456789012345"), "electronic")
+        self.assertEqual(infer_equid_id_type("123456789AB1234"), "ueln")
+        self.assertEqual(infer_equid_id_type("TESTP1"), "passport")
+
+    def test_prioritizes_likely_or_explicit_equid_identifiers(self) -> None:
+        self.assertEqual(
+            auto_query_candidates("123456789012345")[0],
+            ("equids", "electronic"),
+        )
+        self.assertEqual(
+            auto_query_candidates("TESTP1")[0],
+            ("equids", "passport"),
+        )
+        self.assertEqual(
+            auto_query_candidates("IT000000000001")[0],
+            ("cattle", "animal-id"),
+        )
+        self.assertEqual(
+            auto_query_candidates("TEST-EQUID-01", "ueln")[0],
+            ("equids", "ueln"),
+        )
 
     def test_writes_only_documented_output_fields(self) -> None:
         row = parse_animal_metadata(
