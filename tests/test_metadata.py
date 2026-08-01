@@ -7,14 +7,19 @@ from pathlib import Path
 
 from italian_livestock_metadata import (
     EQUID_ID_FIELDS,
+    MOVEMENT_FIELDS,
     OUTPUT_FIELDS,
     SPECIES_CATEGORIES,
     auto_query_candidates,
     build_registry_url,
+    derive_movements_path,
+    equid_id_candidates,
     infer_equid_id_type,
     normalize_identifier,
     parse_animal_metadata,
+    parse_movements,
     read_codes,
+    write_movement_results,
     write_results,
 )
 
@@ -51,6 +56,22 @@ Razza:
 SAMPLE EQUID BREED
 Identificativo/Nome
 SAMPLE HORSE
+Movimentazioni
+Entrato nello stabilimento
+In data
+Motivo
+001AA***
+10/01/2021
+SAMPLE FARM TRANSFER
+002BB***
+15/03/2022
+SAMPLE EVENT
+"""
+
+SYNTHETIC_TABULAR_MOVEMENTS = """
+Movimentazioni
+Entrato nello stabilimento\tIn data\tMotivo
+003CC***\t20/04/2023\tSAMPLE TABULAR EVENT
 """
 
 
@@ -99,6 +120,32 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(row["dpa"], "NO")
         self.assertEqual(row["sex"], "MASCHIO")
         self.assertEqual(row["breed"], "SAMPLE EQUID BREED")
+        self.assertEqual(row["movement_count"], 2)
+
+    def test_parses_movements_as_ordered_records(self) -> None:
+        movements = parse_movements(
+            SYNTHETIC_EQUID_RESPONSE,
+            query_code="TESTP1",
+            species="equids",
+        )
+
+        self.assertEqual(len(movements), 2)
+        self.assertEqual(movements[0]["movement_index"], 1)
+        self.assertEqual(movements[0]["establishment_code"], "001AA***")
+        self.assertEqual(movements[0]["movement_date"], "10/01/2021")
+        self.assertEqual(movements[0]["movement_reason"], "SAMPLE FARM TRANSFER")
+        self.assertEqual(movements[1]["movement_index"], 2)
+
+    def test_parses_tabular_browser_movement_text(self) -> None:
+        movements = parse_movements(
+            SYNTHETIC_TABULAR_MOVEMENTS,
+            query_code="TESTP1",
+            species="equids",
+        )
+
+        self.assertEqual(len(movements), 1)
+        self.assertEqual(movements[0]["establishment_code"], "003CC***")
+        self.assertEqual(movements[0]["movement_date"], "20/04/2023")
 
 
 class InputTests(unittest.TestCase):
@@ -151,6 +198,20 @@ class OutputAndRoutingTests(unittest.TestCase):
         self.assertEqual(infer_equid_id_type("123456789AB1234"), "ueln")
         self.assertEqual(infer_equid_id_type("TESTP1"), "passport")
 
+    def test_tries_both_fields_for_ambiguous_numeric_equid_codes(self) -> None:
+        self.assertEqual(
+            equid_id_candidates("123456789012345"),
+            ["electronic", "ueln"],
+        )
+        self.assertEqual(
+            auto_query_candidates("123456789012345")[:2],
+            [("equids", "electronic"), ("equids", "ueln")],
+        )
+        self.assertEqual(
+            equid_id_candidates("123456789012345", "ueln"),
+            ["ueln"],
+        )
+
     def test_prioritizes_likely_or_explicit_equid_identifiers(self) -> None:
         self.assertEqual(
             auto_query_candidates("123456789012345")[0],
@@ -186,6 +247,31 @@ class OutputAndRoutingTests(unittest.TestCase):
 
         self.assertEqual(reader.fieldnames, OUTPUT_FIELDS)
         self.assertNotIn("unexpected", output_row)
+        self.assertNotIn("movements", output_row)
+
+    def test_writes_movements_to_a_separate_csv(self) -> None:
+        movements = parse_movements(
+            SYNTHETIC_EQUID_RESPONSE,
+            query_code="TESTP1",
+            species="equids",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "movements.csv"
+            write_movement_results(path, movements)
+            with path.open("r", newline="", encoding="utf-8-sig") as handle:
+                reader = csv.DictReader(handle)
+                output_rows = list(reader)
+
+        self.assertEqual(reader.fieldnames, MOVEMENT_FIELDS)
+        self.assertEqual(len(output_rows), 2)
+        self.assertEqual(output_rows[1]["establishment_code"], "002BB***")
+
+    def test_derives_default_movement_output_path(self) -> None:
+        self.assertEqual(
+            derive_movements_path(Path("results.csv")),
+            Path("results_movements.csv"),
+        )
 
 
 if __name__ == "__main__":

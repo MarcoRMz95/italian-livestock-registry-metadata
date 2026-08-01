@@ -12,6 +12,7 @@ Ministry of Health, or IZS Teramo.
 - Supports cattle, sheep/goats, pigs, and equids.
 - Automatically detects the public species category by checking the registries.
 - Supports electronic identifiers, UELNs, and passports for equids.
+- Exports the public movement history as one structured CSV row per movement.
 - Reads identifiers from the command line or a CSV file.
 - Exports normalized results to UTF-8 CSV.
 - Applies a delay between requests to avoid aggressive traffic.
@@ -29,7 +30,12 @@ The tool extracts only the fields displayed by the public form:
 - Sex
 - Breed
 - Date of birth
+- Number of public movement records
 - Public final-event information, when present
+
+Movement records are written to a separate CSV with the query identifier,
+species, chronological row number, movement type, anonymized establishment
+code, date, and reason displayed by VetInfo.
 
 The repository intentionally contains no real animal identifiers, query
 results, farm data, credentials, local paths, or personal information.
@@ -93,10 +99,22 @@ italian-livestock-metadata --species equids --equid-id-type ueln <UELN>
 italian-livestock-metadata --species equids --equid-id-type passport <PASSPORT_NUMBER>
 ```
 
+A 15-digit numeric equid code can be either an electronic identifier or a
+numeric UELN. In automatic mode, the tool tries both public fields and records
+the field that returned the animal. Use `--equid-id-type` only when you want to
+force one field.
+
 Read identifiers from a CSV file containing an `animal_code` column:
 
 ```bash
 italian-livestock-metadata --input input.csv --output results.csv
+```
+
+This creates `results.csv` for animal metadata and `results_movements.csv` for
+the movement history. Choose another movement path when needed:
+
+```bash
+italian-livestock-metadata --output results.csv --movements-output movements.csv <ANIMAL_ID>
 ```
 
 Check that all supported public forms are reachable without submitting an
@@ -125,6 +143,8 @@ The CI workflow never queries a real animal.
 ## Privacy and responsible use
 
 - Input and output CSV files are ignored by Git to reduce accidental uploads.
+- VetInfo masks establishment codes in the public movement history; the tool
+  preserves the masked values exactly as displayed.
 - The tool does not bypass authentication or access restricted VetInfo areas.
 - Use only identifiers you are legally entitled to query.
 - Do not use the tool to identify, profile, or contact animal owners.

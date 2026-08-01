@@ -33,6 +33,15 @@ EQUID_ID_FIELDS = {
     "ueln": "P_CODICE_UELN",
     "passport": "P_PASSAPORTO",
 }
+MOVEMENT_FIELDS = [
+    "query_code",
+    "species",
+    "movement_index",
+    "movement_type",
+    "establishment_code",
+    "movement_date",
+    "movement_reason",
+]
 OUTPUT_FIELDS = [
     "query_code",
     "query_code_type",
@@ -47,6 +56,7 @@ OUTPUT_FIELDS = [
     "sex",
     "breed",
     "birth_date",
+    "movement_count",
     "final_event",
     "event_date",
     "event_location",
@@ -82,6 +92,47 @@ def _extract(text: str, pattern: str) -> str:
     return normalize_text(match.group(1)) if match else ""
 
 
+def parse_movements(
+    text: str | None,
+    query_code: str,
+    species: str,
+) -> list[dict[str, Any]]:
+    """Parse the public movement table into one record per establishment entry."""
+    normalized = normalize_text(text)
+    section_match = re.search(
+        r"(?:^|\n)Entrato nello stabilimento(?:\n|\s+)"
+        r"In data(?:\n|\s+)Motivo\n(?P<rows>.*)",
+        normalized,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not section_match:
+        return []
+
+    row_pattern = re.compile(
+        rf"^(?P<establishment>[A-Z0-9*./-]{{3,40}})(?:\n|\s+)"
+        rf"(?P<date>{DATE_PATTERN})(?:\n|\s+)"
+        r"(?P<reason>[^\n]+)$",
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    movements: list[dict[str, Any]] = []
+    for index, match in enumerate(
+        row_pattern.finditer(section_match.group("rows")),
+        start=1,
+    ):
+        movements.append(
+            {
+                "query_code": query_code,
+                "species": species,
+                "movement_index": index,
+                "movement_type": "entry",
+                "establishment_code": normalize_text(match.group("establishment")),
+                "movement_date": match.group("date"),
+                "movement_reason": normalize_text(match.group("reason")),
+            }
+        )
+    return movements
+
+
 def parse_animal_metadata(
     text: str | None,
     query_code: str,
@@ -104,6 +155,7 @@ def parse_animal_metadata(
     passport = _extract(normalized, r"Passaporto\s*:\s*([A-Z0-9./-]+)")
     equid_name = _extract(normalized, r"Identificativo/Nome\s*:?\s*([^\n]+)")
     dpa = _extract(normalized, r"Dpa\s*:\s*([^\n]+)")
+    movements = parse_movements(normalized, query_code, species)
 
     final_match = re.search(
         rf"(MACELLAZIONE\s+EFFETTUATA\s+IL\s+({DATE_PATTERN})\s+IN\s+([^\n]+))",
@@ -129,6 +181,8 @@ def parse_animal_metadata(
         "sex": sex,
         "breed": breed,
         "birth_date": birth_date,
+        "movement_count": len(movements),
+        "movements": movements,
         "final_event": final_event,
         "event_date": event_date,
         "event_location": event_location,
@@ -170,31 +224,43 @@ def read_codes(
     return codes
 
 
-def infer_equid_id_type(code: str) -> str:
-    """Infer which of the three public equid fields accepts an identifier."""
+def equid_id_candidates(code: str, requested_type: str = "auto") -> list[str]:
+    """Return likely equid fields, including fallbacks for ambiguous codes."""
     identifier = normalize_identifier(code)
+    if requested_type != "auto":
+        if requested_type not in EQUID_ID_FIELDS:
+            choices = ", ".join(("auto", *EQUID_ID_FIELDS))
+            raise ValueError(
+                f"Unsupported equid identifier type. Choose one of: {choices}"
+            )
+        return [requested_type]
+
+    # A 15-digit value can be either an electronic identifier or a numeric
+    # UELN, so both public fields must be tried before declaring it missing.
     if len(identifier) == 15 and identifier.isdigit():
-        return "electronic"
+        return ["electronic", "ueln"]
     if len(identifier) == 15 and identifier.isalnum():
-        return "ueln"
-    return "passport"
+        return ["ueln"]
+    return ["passport"]
+
+
+def infer_equid_id_type(code: str) -> str:
+    """Return the first likely equid identifier type for compatibility."""
+    return equid_id_candidates(code)[0]
 
 
 def resolve_equid_id_type(code: str, requested_type: str) -> str:
     """Resolve an explicit or automatically inferred equid identifier type."""
-    if requested_type == "auto":
-        return infer_equid_id_type(code)
-    if requested_type not in EQUID_ID_FIELDS:
-        choices = ", ".join(("auto", *EQUID_ID_FIELDS))
-        raise ValueError(f"Unsupported equid identifier type. Choose one of: {choices}")
-    return requested_type
+    return equid_id_candidates(code, requested_type)[0]
 
 
 def auto_query_candidates(code: str, equid_id_type: str = "auto") -> list[tuple[str, str]]:
     """Return a deterministic lookup order for automatic species detection."""
     identifier = normalize_identifier(code)
-    resolved_equid_type = resolve_equid_id_type(identifier, equid_id_type)
-    equid_candidate = ("equids", resolved_equid_type)
+    equid_candidates = [
+        ("equids", code_type)
+        for code_type in equid_id_candidates(identifier, equid_id_type)
+    ]
     standard_candidates = [
         ("cattle", "animal-id"),
         ("sheep-goats", "animal-id"),
@@ -209,8 +275,8 @@ def auto_query_candidates(code: str, equid_id_type: str = "auto") -> list[tuple[
         or len(identifier) <= 10
     )
     if likely_equid:
-        return [equid_candidate, *standard_candidates]
-    return [*standard_candidates, equid_candidate]
+        return [*equid_candidates, *standard_candidates]
+    return [*standard_candidates, *equid_candidates]
 
 
 def verify_registry_form(page: Page, species: str, timeout_ms: int) -> None:
@@ -258,6 +324,9 @@ def query_animal(
     equid_id_type: str = "auto",
 ) -> dict[str, Any]:
     """Submit one animal identifier and return parsed public metadata."""
+    if species == "equids" and equid_id_type == "auto":
+        return query_equid_auto(page, code, timeout_ms, settle_ms)
+
     try:
         verify_registry_form(page, species, timeout_ms)
         query_code_type = (
@@ -306,11 +375,39 @@ def query_animal(
         "sex": "",
         "breed": "",
         "birth_date": "",
+        "movement_count": 0,
+        "movements": [],
         "final_event": "",
         "event_date": "",
         "event_location": "",
         "error": error,
     }
+
+
+def query_equid_auto(
+    page: Page,
+    code: str,
+    timeout_ms: int,
+    settle_ms: int,
+) -> dict[str, Any]:
+    """Try every plausible equid field until a matching record is found."""
+    last_result: dict[str, Any] | None = None
+    for code_type in equid_id_candidates(code):
+        result = query_animal(
+            page,
+            code,
+            "equids",
+            timeout_ms,
+            settle_ms,
+            equid_id_type=code_type,
+        )
+        if result["found"]:
+            return result
+        last_result = result
+
+    if last_result is None:
+        raise RuntimeError("No equid identifier fields were available for the query.")
+    return last_result
 
 
 def detect_and_query_animal(
@@ -347,6 +444,8 @@ def detect_and_query_animal(
         "sex": "",
         "breed": "",
         "birth_date": "",
+        "movement_count": 0,
+        "movements": [],
         "final_event": "",
         "event_date": "",
         "event_location": "",
@@ -359,6 +458,25 @@ def write_results(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def derive_movements_path(metadata_path: Path) -> Path:
+    """Derive the default movement CSV path from the metadata output path."""
+    suffix = metadata_path.suffix or ".csv"
+    return metadata_path.with_name(f"{metadata_path.stem}_movements{suffix}")
+
+
+def write_movement_results(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Write one public movement record per CSV row."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=MOVEMENT_FIELDS,
+            extrasaction="ignore",
+        )
         writer.writeheader()
         writer.writerows(rows)
 
@@ -401,6 +519,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("animal_metadata.csv"),
         help="Output CSV path (default: animal_metadata.csv).",
+    )
+    parser.add_argument(
+        "--movements-output",
+        type=Path,
+        help=(
+            "Movement CSV path (default: '<output stem>_movements.csv')."
+        ),
     )
     parser.add_argument(
         "--species",
@@ -497,8 +622,16 @@ def main(argv: list[str] | None = None) -> int:
             browser.close()
 
     write_results(args.output, results)
+    movements = [
+        movement
+        for result in results
+        for movement in result.get("movements", [])
+    ]
+    movements_output = args.movements_output or derive_movements_path(args.output)
+    write_movement_results(movements_output, movements)
     found_count = sum(bool(row["found"]) for row in results)
     print(f"Saved {len(results)} rows to {args.output}")
+    print(f"Saved {len(movements)} movements to {movements_output}")
     print(f"Records recognized: {found_count}/{len(results)}")
     return 0 if found_count == len(results) else 2
 
